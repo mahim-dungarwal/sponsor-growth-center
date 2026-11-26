@@ -163,31 +163,62 @@ How you work:
 type Part = { text?: string; functionCall?: { name: string; args?: Record<string, unknown> }; functionResponse?: unknown; thoughtSignature?: string; thought?: boolean };
 type Content = { role: string; parts: Part[] };
 
+async function callGemini(body: Record<string, unknown>, key: string, model: string, timeoutMs: number) {
+  const base = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), Math.max(3000, timeoutMs));
+  try {
+    return await fetch(`${base}/v1beta/models/${model}:generateContent`, {
+      method: 'POST', signal: ctl.signal,
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify(body),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function chat(messages: { role: 'user' | 'assistant'; content: string }[], viewAsOf: string) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) {
     return { reply: 'The AI copilot is not configured yet: set GEMINI_API_KEY in the deployment settings. The dashboard and management tool work without it.', tool_calls: [], proposals: [] };
   }
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+  // Stay inside the hosting time limit: after ~40 s stop calling tools and answer from what was gathered.
+  const started = Date.now();
+  const budgetMs = Number(process.env.COPILOT_BUDGET_MS) || 40000;
+  const hardMs = budgetMs + 15000;
   const contents: Content[] = messages.slice(-16).map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
   const toolCalls: { name: string; args: Record<string, unknown>; ok: boolean }[] = [];
   const proposals: unknown[] = [];
+  let lowThinking = process.env.GEMINI_THINKING !== 'default';
   for (let step = 0; step < 8; step++) {
-    const base = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
-    const res = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemPrompt(viewAsOf) }] },
-        contents,
-        tools: [{ functionDeclarations: TOOLS }],
-        generationConfig: { temperature: 0.2 },
-      }),
-    });
+    const elapsed = Date.now() - started;
+    const finalOnly = elapsed > budgetMs || step === 7;
+    const body: Record<string, unknown> = {
+      systemInstruction: { parts: [{ text: systemPrompt(viewAsOf) + (finalOnly ? '\n\nTime is nearly up: answer now from the tool results you already have, and say briefly if anything could not be checked.' : '') }] },
+      contents,
+      tools: [{ functionDeclarations: TOOLS }],
+      toolConfig: { functionCallingConfig: { mode: finalOnly ? 'NONE' : 'AUTO' } },
+      generationConfig: { temperature: 0.2, ...(lowThinking ? { thinkingConfig: { thinkingLevel: 'low' } } : {}) },
+    };
+    let res: Response;
+    try {
+      res = await callGemini(body, key, model, hardMs - elapsed);
+    } catch {
+      return { reply: 'The AI model took too long to respond. Please ask again, or ask a narrower question.', tool_calls: toolCalls, proposals };
+    }
+    if (!res.ok && res.status === 400 && lowThinking) {
+      const t = await res.text();
+      if (/thinking/i.test(t)) { lowThinking = false; step--; continue; } // model does not accept thinkingLevel: retry without it
+      return { reply: 'AI request failed (400).', error: t.slice(0, 500), tool_calls: toolCalls, proposals };
+    }
     if (!res.ok) {
-      const body = await res.text();
-      const msg = res.status === 429 ? 'The AI model is rate-limited right now (free tier). Please wait a minute and try again.' : `AI request failed (${res.status}).`;
-      return { reply: msg, error: body.slice(0, 500), tool_calls: toolCalls, proposals };
+      const errBody = await res.text();
+      const msg = res.status === 429 ? 'The AI model is rate-limited right now (free tier). Please wait a minute and try again.'
+        : res.status === 404 ? `AI model "${model}" was not found for this API key. Set GEMINI_MODEL to a current model.`
+        : `AI request failed (${res.status}).`;
+      return { reply: msg, error: errBody.slice(0, 500), tool_calls: toolCalls, proposals };
     }
     const data = await res.json();
     const content: Content | undefined = data?.candidates?.[0]?.content;
@@ -196,12 +227,11 @@ export async function chat(messages: { role: 'user' | 'assistant'; content: stri
     }
     contents.push({ role: 'model', parts: content.parts });
     const calls = content.parts.filter((p) => p.functionCall);
-    if (!calls.length) {
+    if (!calls.length || finalOnly) {
       const text = content.parts.filter((p) => p.text && !p.thought).map((p) => p.text).join('').trim();
-      return { reply: text || '(no answer)', tool_calls: toolCalls, proposals };
+      return { reply: text || (finalOnly ? 'I ran out of time before finishing that analysis. Please ask a narrower question (for example, one campaign or one metric).' : '(no answer)'), tool_calls: toolCalls, proposals };
     }
-    const responses: Part[] = [];
-    for (const c of calls) {
+    const responses: Part[] = await Promise.all(calls.map(async (c) => {
       const name = c.functionCall!.name;
       const args = c.functionCall!.args || {};
       let result: unknown;
@@ -213,8 +243,8 @@ export async function chat(messages: { role: 'user' | 'assistant'; content: stri
       const r = result as Record<string, unknown>;
       if (r && r.proposal) proposals.push(r.proposal);
       toolCalls.push({ name, args, ok: !(r && r.error) });
-      responses.push({ functionResponse: { name, response: { result } } });
-    }
+      return { functionResponse: { name, response: { result } } };
+    }));
     contents.push({ role: 'user', parts: responses });
   }
   return { reply: 'I needed too many steps to answer that. Please ask a narrower question.', tool_calls: toolCalls, proposals };
